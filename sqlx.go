@@ -579,6 +579,7 @@ type Rows struct {
 	started bool
 	fields  [][]int
 	values  []interface{}
+	wraps   []ScanWrapper
 }
 
 // SliceScan using this Rows.
@@ -618,6 +619,7 @@ func (r *Rows) StructScan(dest interface{}) error {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
 		r.values = make([]interface{}, len(columns))
+		r.wraps = scanWrappersFor(v.Type(), r.fields)
 		r.started = true
 	}
 
@@ -625,6 +627,7 @@ func (r *Rows) StructScan(dest interface{}) error {
 	if err != nil {
 		return err
 	}
+	applyScanWrappers(r.values, r.wraps)
 	// scan into the struct field pointers and append to our results
 	err = r.Scan(r.values...)
 	if err != nil {
@@ -753,7 +756,7 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 	}
 
 	base := reflectx.Deref(v.Type())
-	scannable := isScannable(base)
+	scannable := scanWrapperFor(v.Type()) != nil || isScannable(base)
 
 	if structOnly && scannable {
 		return structOnlyError(base)
@@ -769,7 +772,7 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 	}
 
 	if scannable {
-		return r.Scan(dest)
+		return r.Scan(wrapScanDest(dest, v.Type()))
 	}
 
 	m := r.Mapper
@@ -785,6 +788,7 @@ func (r *Row) scanAny(dest interface{}, structOnly bool) error {
 	if err != nil {
 		return err
 	}
+	applyScanWrappers(values, scanWrappersFor(base, fields))
 	// scan into the struct field pointers and append to our results
 	return r.Scan(values...)
 }
@@ -913,9 +917,21 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 	}
 	direct.SetLen(0)
 
-	isPtr := slice.Elem().Kind() == reflect.Ptr
-	base := reflectx.Deref(slice.Elem())
-	scannable := isScannable(base)
+	elem := slice.Elem()
+	isPtr := elem.Kind() == reflect.Ptr
+	base := reflectx.Deref(elem)
+
+	// scan hook (see RegisterScanner): for []*T with **T registered, scan each
+	// element through a wrapped **T so the wrapper controls the pointer (e.g.
+	// nil for NULL); otherwise wrap *T if registered.
+	var elemWrap, baseWrap ScanWrapper
+	if isPtr {
+		elemWrap = scanWrapperFor(reflect.PtrTo(elem))
+	}
+	if elemWrap == nil {
+		baseWrap = scanWrapperFor(reflect.PtrTo(base))
+	}
+	scannable := elemWrap != nil || baseWrap != nil || isScannable(base)
 
 	if structOnly && scannable {
 		return structOnlyError(base)
@@ -948,6 +964,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			return fmt.Errorf("missing destination name %s in %T", columns[f], dest)
 		}
 		values = make([]interface{}, len(columns))
+		wraps := scanWrappersFor(base, fields)
 
 		for rows.Next() {
 			// create a new struct type (which returns PtrTo) and indirect it
@@ -958,6 +975,7 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 			if err != nil {
 				return err
 			}
+			applyScanWrappers(values, wraps)
 
 			// scan into the struct field pointers and append to our results
 			err = rows.Scan(values...)
@@ -971,10 +989,28 @@ func scanAll(rows rowsi, dest interface{}, structOnly bool) error {
 				direct.Set(reflect.Append(direct, v))
 			}
 		}
+	} else if elemWrap != nil {
+		for rows.Next() {
+			pp := reflect.New(elem)
+			var target interface{} = pp.Interface()
+			if s := elemWrap(target); s != nil {
+				target = s
+			}
+			if err = rows.Scan(target); err != nil {
+				return err
+			}
+			direct.Set(reflect.Append(direct, pp.Elem()))
+		}
 	} else {
 		for rows.Next() {
 			vp = reflect.New(base)
-			err = rows.Scan(vp.Interface())
+			var target interface{} = vp.Interface()
+			if baseWrap != nil {
+				if s := baseWrap(target); s != nil {
+					target = s
+				}
+			}
+			err = rows.Scan(target)
 			if err != nil {
 				return err
 			}
